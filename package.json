@@ -1,0 +1,29 @@
+{
+  "name": "vistar-spd-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "VST SPD - Pre-Packing Process Automation API (Node.js/Express/PostgreSQL)",
+  "type": "module",
+  "engines": { "node": ">=20.11.0" },
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "migrate": "node src/db/migrate.js",
+    "seed": "node src/db/seed.js",
+    "reset": "node src/db/seed.js --reset",
+    "smoke": "node scripts/smoke.js",
+    "test": "node scripts/smoke.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^3.0.2",
+    "cors": "^2.8.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.0.2",
+    "nodemailer": "^6.10.0",
+    "pdfkit": "^0.17.2",
+    "pg": "^8.13.1"
+  }
+}
