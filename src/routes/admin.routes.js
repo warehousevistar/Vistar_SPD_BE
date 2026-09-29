@@ -130,6 +130,12 @@ adminRoutes.put('/config', canSupervise, wrap(async (req, res) => {
     if (cols.length < 3) throw badRequest('The GRN import needs at least Invoice No., Part Number and GRN Quantity');
     patch.grnCols = cols;
   }
+  if (patch.grnColsOptional !== undefined) {
+    // May be emptied — an optional column list of none is a valid choice.
+    patch.grnColsOptional = Array.isArray(patch.grnColsOptional)
+      ? patch.grnColsOptional
+      : String(patch.grnColsOptional).split(',').map((s) => s.trim()).filter(Boolean);
+  }
 
   const after = await saveSettings(patch, req.user.id);
   await audit({

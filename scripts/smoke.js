@@ -191,6 +191,34 @@ async function main() {
   const pdf = await call('GET', `/labels/sheet.pdf?lineId=${lineId}`, { token: T, raw: true });
   check('label sheet renders as PDF (FR-3.2)', pdf.status === 200 && pdf.buf.slice(0, 4).toString() === '%PDF', `${pdf.buf.length} bytes`);
 
+  /* ---- FR-3.5 the MOQ split ---- */
+  const splitLine = lines.data.lines.find((l) => l.moq && Number(l.grn_qty) > Number(l.moq));
+  if (!splitLine) {
+    check('the shift has a line with an MOQ to split (FR-3.5)', false, 'none seeded');
+  } else {
+    const sp = await call('GET', `/labels/${splitLine.id}/preview`, { token: T });
+    const ls = sp.data.labels ?? [];
+    const expected = Math.ceil(Number(splitLine.grn_qty) / Number(splitLine.moq));
+    const total = ls.reduce((s, l) => s + Number(l.qty), 0);
+    check('a line with an MOQ previews one label per pack (FR-3.5)',
+      sp.status === 200 && ls.length === expected,
+      `${splitLine.part_no}: GRN ${splitLine.grn_qty} ÷ MOQ ${splitLine.moq} → ${ls.length} label(s) of ${ls.map((l) => l.qty).join(' + ')}`);
+    check('the labels account for the whole GRN quantity (FR-3.5, BR-01)',
+      Math.round(total * 100) === Math.round(Number(splitLine.grn_qty) * 100),
+      `${total} vs ${splitLine.grn_qty}`);
+    check('each label carries its own quantity in its QR payload (FR-3.5)',
+      ls.every((l) => l.payload.endsWith(`|${l.qty}`)) && new Set(ls.map((l) => l.qr.length)).size === 1,
+      ls.map((l) => l.payload).join('  '));
+
+    /* The sheet is the artefact that reaches the printer, so the page count is
+       what actually proves the split — a preview that splits and a PDF that
+       does not would send one label for a pack that needs two. */
+    const splitPdf = await call('GET', `/labels/sheet.pdf?lineId=${splitLine.id}`, { token: T, raw: true });
+    const pages = (splitPdf.buf.toString('latin1').match(/\/Type\s*\/Page[^s]/g) ?? []).length;
+    check('the printed sheet carries one page per label (FR-3.2/3.5)',
+      splitPdf.status === 200 && pages === expected, `${pages} page(s), expected ${expected}`);
+  }
+
   /* ---- FR-8 hourly ---- */
   const gen = await call('POST', '/hourly/generate', { token: T, body: { shiftId: SHIFT } });
   check('hourly report generated and retained (FR-8.1/8.3)', gen.status === 201 && !!gen.data.report?.id, gen.data.report?.id);

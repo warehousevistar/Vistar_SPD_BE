@@ -83,8 +83,22 @@ CREATE TABLE IF NOT EXISTS grn_lines (
   grn_qty     NUMERIC(14,2) NOT NULL CHECK (grn_qty > 0),
   vendor      TEXT NOT NULL DEFAULT '',
   grn_date    DATE NOT NULL,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  -- FR-3.5 — the minimum order quantity the part is packed in, when the SAP
+  -- export carries one. NULL means the line prints a single label for its whole
+  -- GRN quantity, which is what every line did before MOQ existed.
+  moq         NUMERIC(14,2) CHECK (moq IS NULL OR moq > 0),
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- An MOQ mistyped as 1 where 100 was meant turns one line into thousands of
+  -- labels, and the sheet for a 5,000-line shift (NFR-1.2) would then be built
+  -- a page at a time in memory. The import names the offending row first; this
+  -- is the backstop for anything that reaches the table another way.
+  -- `moq <= 0` short-circuits ahead of the division, which the positivity
+  -- check above then reports properly.
+  CONSTRAINT grn_lines_moq_label_count
+    CHECK (moq IS NULL OR moq <= 0 OR grn_qty / moq <= 500)
 );
+-- For databases created before MOQ; a no-op on a fresh one.
+ALTER TABLE grn_lines ADD COLUMN IF NOT EXISTS moq NUMERIC(14,2) CHECK (moq IS NULL OR moq > 0);
 CREATE INDEX IF NOT EXISTS grn_lines_shift_idx   ON grn_lines (shift_id);
 CREATE INDEX IF NOT EXISTS grn_lines_invoice_idx ON grn_lines (invoice_no);
 CREATE INDEX IF NOT EXISTS grn_lines_part_idx    ON grn_lines (part_no);

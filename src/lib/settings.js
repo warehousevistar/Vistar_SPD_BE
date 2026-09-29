@@ -20,6 +20,11 @@ export const DEFAULTS = {
      release. Each entry is the header the file is expected to carry; the
      importer matches case- and space-insensitively. */
   grnCols: ['Invoice No.', 'Part Number', 'Part Description', 'GRN Quantity', 'UOM', 'Vendor', 'GRN Date'],
+  /* FR-3.5 — columns read when present and ignored when absent. MOQ is here
+     rather than in grnCols because making it required would reject every export
+     produced before the rule existed; a line without one simply prints a single
+     label, exactly as it did before. */
+  grnColsOptional: ['MOQ'],
 };
 
 let cache = null;

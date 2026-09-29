@@ -6,9 +6,53 @@ import PDFDocument from 'pdfkit';
    frontend draws the same layout on screen for the preview, so the two agree.
    ========================================================================== */
 
-/** The one place the label's payload string is defined, so the QR the printer
-    puts on the box and the QR the scanner expects cannot drift apart. */
-export const labelPayload = (line) => `${line.part_no}|${line.invoice_no}|${line.grn_qty}`;
+/**
+ * FR-3.5 — one GRN line becomes one label per MOQ pack, plus a remainder.
+ *
+ * A line of 350 with an MOQ of 300 is two labels, 300 and 50, because that is
+ * how the material physically leaves the table: one full pack and one part
+ * pack, each needing its own identification. Without an MOQ — which is every
+ * line the system handled before this rule, and every export that does not
+ * carry the column — the result is the single whole-quantity label of FR-3.1.
+ *
+ * Quantities are NUMERIC(14,2), so the arithmetic is done in hundredths. A
+ * 0.1-step MOQ divided in floating point drifts, and the drift lands in the
+ * remainder label, which is the one a supervisor is least likely to re-check.
+ *
+ * @returns {object[]} the line, once per label, with `label_qty`, `label_index`
+ *   and `label_of`. Never empty.
+ */
+export function labelUnits(line) {
+  const qty = Math.round(Number(line.grn_qty) * 100);
+  const moq = line.moq == null || line.moq === '' ? 0 : Math.round(Number(line.moq) * 100);
+
+  if (!Number.isFinite(qty) || qty <= 0) return [{ ...line, label_qty: Number(line.grn_qty), label_index: 1, label_of: 1 }];
+  if (!Number.isFinite(moq) || moq <= 0 || moq >= qty) {
+    return [{ ...line, label_qty: Number(line.grn_qty), label_index: 1, label_of: 1 }];
+  }
+
+  const parts = [];
+  for (let left = qty; left > 0; left -= moq) parts.push(Math.min(moq, left));
+  return parts.map((p, i) => ({
+    ...line,
+    label_qty: p / 100,
+    label_index: i + 1,
+    label_of: parts.length,
+  }));
+}
+
+/**
+ * The one place the label's payload string is defined, so the QR the printer
+ * puts on the box and the QR the scanner expects cannot drift apart.
+ *
+ * A split label carries its *own* quantity, not the line's — a scanner pointed
+ * at the 50-unit pouch has to read 50. The index is deliberately not encoded:
+ * the QR budget here is 26 bytes and the demo payload already uses 23, so a
+ * `|1/2` suffix would be silently truncated by the encoder. Two labels of the
+ * same size therefore carry the same payload, which is right — the pouches are
+ * interchangeable, and it is the printed "1 of 2" that tells them apart.
+ */
+export const labelPayload = (u) => `${u.part_no}|${u.invoice_no}|${u.label_qty ?? u.grn_qty}`;
 
 /* ---- QR encoding ---------------------------------------------------------
    A full QR encoder is a large dependency for one 62pt square. This writes a
@@ -200,7 +244,8 @@ function code128B(text) {
 export const barcodeWidths = (text) => [...code128B(text)].map(Number);
 
 /**
- * FR-3.2 — the printable label sheet, one label per GRN line.
+ * FR-3.2 / FR-3.5 — the printable label sheet: one label per MOQ pack, so a
+ * 350 line with an MOQ of 300 produces a 300 label and a 50 label.
  * 100 × 60 mm at 72 dpi is 283.5 × 170.1 pt, which is the SPD Standard stock.
  */
 export function buildLabelPdf(lines, { template = 'SPD Standard 100×60' } = {}) {
@@ -213,7 +258,7 @@ export function buildLabelPdf(lines, { template = 'SPD Standard 100×60' } = {})
   const [W, H] = size;
   const M = 10;
 
-  for (const l of lines) {
+  for (const l of lines.flatMap(labelUnits)) {
     doc.addPage({ size, margin: 0 });
 
     // The brand ribbon down the left edge, as in the on-screen label.
@@ -228,7 +273,8 @@ export function buildLabelPdf(lines, { template = 'SPD Standard 100×60' } = {})
 
     const cols = [
       ['INVOICE', l.invoice_no],
-      ['GRN QTY', `${Number(l.grn_qty).toLocaleString('en-IN')} ${l.uom}`],
+      // The label's own quantity, not the line's: this pouch holds 50 of 350.
+      ['QTY', `${Number(l.label_qty).toLocaleString('en-IN')} ${l.uom}`],
       ['GRN DATE', fmtLabelDate(l.grn_date)],
     ];
     let cx = x;
@@ -261,6 +307,15 @@ export function buildLabelPdf(lines, { template = 'SPD Standard 100×60' } = {})
       bx += w * unit;
     });
     doc.restore();
+
+    // FR-3.1 still wants the GRN quantity on the label, and FR-3.5 has just
+    // replaced the QTY field with this pack's share of it — so when a line is
+    // split, both numbers are printed and the pack says which one it is.
+    if (l.label_of > 1) {
+      doc.fillColor('#14091F').font('Helvetica-Bold').fontSize(7.5)
+        .text(`${l.label_index} OF ${l.label_of}  ·  GRN ${Number(l.grn_qty).toLocaleString('en-IN')} ${l.uom}`,
+          W - M - 120, M + 60, { width: 120, align: 'right', lineBreak: false });
+    }
 
     doc.fillColor('#555555').font('Helvetica').fontSize(6.5)
       .text(String(l.vendor || '').slice(0, 34), x, by - 10, { lineBreak: false })

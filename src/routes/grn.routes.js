@@ -84,6 +84,7 @@ grnRoutes.post('/grn/upload', canSupervise, grnUpload, handleUploadErrors, wrap(
     buffer: req.file.buffer,
     filename: req.file.originalname,
     requiredCols: cfg.grnCols,
+    optionalCols: cfg.grnColsOptional,
     defaultGrnDate: defaultDate,
   });
 
@@ -134,9 +135,9 @@ grnRoutes.post('/grn/upload', canSupervise, grnUpload, handleUploadErrors, wrap(
     for (const r of rows) {
       seq += 1;
       await q(
-        `INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, part_desc, uom, grn_qty, vendor, grn_date)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
-        [lineId(seq), batchId, shiftId, r.invoice_no, r.part_no, r.part_desc, r.uom, r.grn_qty, r.vendor, r.grn_date],
+        `INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, part_desc, uom, grn_qty, vendor, grn_date, moq)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [lineId(seq), batchId, shiftId, r.invoice_no, r.part_no, r.part_desc, r.uom, r.grn_qty, r.vendor, r.grn_date, r.moq ?? null],
       );
     }
 

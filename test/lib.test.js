@@ -7,6 +7,7 @@ import { previewSubmission } from '../src/lib/packing.js';
 import { pad, lineId, nextId, nextBatchId } from '../src/lib/ids.js';
 import { DEFAULTS } from '../src/lib/settings.js';
 import { parseGrnFile } from '../src/services/grnImport.js';
+import { labelUnits, labelPayload } from '../src/services/labels.js';
 import { buildCsv, buildWorkbook } from '../src/services/excelExport.js';
 import { hourlyReportHtml } from '../src/services/mailer.js';
 
@@ -271,4 +272,159 @@ test('the hourly email renders with no submissions yet', () => {
     tables: '0 occupied', exceptions: 0, members: [],
   });
   assert.match(html, /—/, 'an em dash rather than an empty member list');
+});
+
+/* ============================================================================
+   FR-3.5 — the MOQ label split.
+
+   "If MOQ is 300 and actual is 350, print 300 then again 50 separate." The rule
+   is small enough to read at a glance and easy to get subtly wrong at the
+   boundaries: an exact multiple must not produce an empty remainder label, an
+   MOQ above the quantity must not produce a negative one, and a decimal MOQ
+   must not leave floating-point dust in the remainder — which is the label a
+   supervisor is least likely to re-check.
+   ========================================================================== */
+
+const line = (grn_qty, moq) =>
+  ({ part_no: '76621-MFS', invoice_no: 'INV-77001', uom: 'NOS', grn_qty, moq });
+const split = (grn_qty, moq) => labelUnits(line(grn_qty, moq)).map((u) => u.label_qty);
+
+test('a line splits into one label per MOQ pack, plus the remainder', () => {
+  assert.deepEqual(split(350, 300), [300, 50]);      // the rule as stated
+  assert.deepEqual(split(1000, 300), [300, 300, 300, 100]);
+  assert.deepEqual(split(360, 100), [100, 100, 100, 60]);
+});
+
+test('an exact multiple produces no empty remainder label', () => {
+  assert.deepEqual(split(300, 300), [300]);
+  assert.deepEqual(split(900, 300), [300, 300, 300]);
+  assert.deepEqual(split(100, 50), [50, 50]);
+});
+
+test('an MOQ at or above the quantity leaves the line whole', () => {
+  assert.deepEqual(split(140, 200), [140]);
+  assert.deepEqual(split(140, 140), [140]);
+});
+
+test('no MOQ is the FR-3.1 label, exactly as before the rule existed', () => {
+  for (const moq of [null, undefined, 0, '', NaN]) {
+    assert.deepEqual(split(350, moq), [350], `moq ${String(moq)}`);
+  }
+});
+
+test('the labels always account for the whole GRN quantity', () => {
+  for (const [qty, moq] of [[350, 300], [1000, 300], [360, 100], [7, 2], [100, 33], [10.5, 0.5]]) {
+    const parts = split(qty, moq);
+    const total = parts.reduce((s, p) => s + p, 0);
+    assert.equal(Math.round(total * 100), Math.round(qty * 100),
+      `${qty} ÷ ${moq} came to ${total}`);
+    assert.ok(parts.every((p) => p > 0), `${qty} ÷ ${moq} produced an empty label`);
+    assert.ok(parts.every((p) => p <= moq), `${qty} ÷ ${moq} produced a label above the MOQ`);
+  }
+});
+
+test('a decimal MOQ divides without leaving floating-point dust', () => {
+  // 0.1 + 0.2 !== 0.3 in binary floating point, and the error would land in the
+  // remainder. The arithmetic runs in hundredths for this reason.
+  assert.deepEqual(split(10.5, 0.5), Array(21).fill(0.5));
+  assert.deepEqual(split(1, 0.3), [0.3, 0.3, 0.3, 0.1]);
+});
+
+test('every label is numbered, and an unsplit one says 1 of 1', () => {
+  const two = labelUnits(line(350, 300));
+  assert.deepEqual(two.map((u) => [u.label_index, u.label_of]), [[1, 2], [2, 2]]);
+  const one = labelUnits(line(270, null));
+  assert.deepEqual(one.map((u) => [u.label_index, u.label_of]), [[1, 1]]);
+});
+
+test('a label carries the rest of its line', () => {
+  const [first] = labelUnits(line(350, 300));
+  assert.equal(first.part_no, '76621-MFS');
+  assert.equal(first.invoice_no, 'INV-77001');
+  assert.equal(first.grn_qty, 350, 'the line total must survive for FR-3.1');
+});
+
+test('the QR payload carries the label quantity, not the line quantity', () => {
+  const [a, b] = labelUnits(line(350, 300));
+  assert.equal(labelPayload(a), '76621-MFS|INV-77001|300');
+  assert.equal(labelPayload(b), '76621-MFS|INV-77001|50');
+
+  // An unsplit line's payload is byte-identical to what it was before MOQ, so
+  // codes already printed and scanned keep working.
+  assert.equal(labelPayload(labelUnits(line(270, null))[0]), '76621-MFS|INV-77001|270');
+});
+
+test('a split payload still fits the QR budget, so nothing is truncated', () => {
+  // qrMatrix truncates above 26 bytes rather than refusing, which would corrupt
+  // the code silently. This is why the index is not encoded in the payload.
+  for (const u of labelUnits(line(350, 300))) {
+    assert.ok(Buffer.byteLength(labelPayload(u)) <= 26,
+      `${labelPayload(u)} is ${Buffer.byteLength(labelPayload(u))} bytes`);
+  }
+});
+
+/* ---- the import reads MOQ when it is there, and only then --------------- */
+
+const HEADER_MOQ = `${HEADER},MOQ`;
+
+test('MOQ is optional — a file without the column still imports', async () => {
+  const { rows, errors } = await parse([
+    HEADER,
+    'INV-1,90210-ABX,Bracket LH,270,NOS,DynaFast,09-Sep-2026',
+  ].join('\n'));
+  assert.equal(errors.length, 0);
+  assert.equal(rows[0].moq, null, 'a missing column is not a missing value');
+});
+
+test('MOQ is read when the column is present, and a blank cell is not an error', async () => {
+  const { rows, errors } = await parse([
+    HEADER_MOQ,
+    'INV-1,76621-MFS,Mount Foot,350,NOS,DynaFast,09-Sep-2026,300',
+    'INV-1,90210-ABX,Bracket LH,270,NOS,DynaFast,09-Sep-2026,',
+    'INV-1,82111-WHM,Washer,360,NOS,Precision,09-Sep-2026,"1,000"',
+  ].join('\n'));
+  assert.deepEqual(errors, []);
+  assert.deepEqual(rows.map((r) => r.moq), [300, null, 1000]);
+});
+
+test('a present but unusable MOQ is rejected by row and column (NFR-4.2)', async () => {
+  const { rows, errors } = await parse([
+    HEADER_MOQ,
+    'INV-1,76621-MFS,Mount Foot,350,NOS,DynaFast,09-Sep-2026,abc',
+    'INV-1,90211-ABX,Bracket RH,340,NOS,DynaFast,09-Sep-2026,0',
+    'INV-1,82111-WHM,Washer,360,NOS,Precision,09-Sep-2026,-5',
+  ].join('\n'));
+  assert.equal(rows.length, 0, 'a bad MOQ must not import silently as no MOQ');
+  assert.deepEqual(errors.map((e) => [e.row, e.column]), [[2, 'MOQ'], [3, 'MOQ'], [4, 'MOQ']]);
+  assert.match(errors[0].error, /not a number/i);
+  assert.match(errors[1].error, /greater than zero/i);
+});
+
+test('an MOQ that would print thousands of labels is refused, and says so', async () => {
+  // Almost always a 1 typed where 100 was meant.
+  const { rows, errors } = await parse([
+    HEADER_MOQ,
+    'INV-1,76621-MFS,Mount Foot,400000,NOS,DynaFast,09-Sep-2026,1',
+  ].join('\n'));
+  assert.equal(rows.length, 0);
+  assert.equal(errors[0].column, 'MOQ');
+  assert.match(errors[0].error, /400000 labels/);
+  assert.match(errors[0].error, /limit is 500/);
+});
+
+test('the MOQ header is matched by any of its usual spellings', async () => {
+  for (const header of ['MOQ', 'moq', 'Min Order Qty', 'Minimum Order Quantity', 'Pack Size']) {
+    const { rows, errors } = await parse([
+      `${HEADER},${header}`,
+      'INV-1,76621-MFS,Mount Foot,350,NOS,DynaFast,09-Sep-2026,300',
+    ].join('\n'));
+    assert.deepEqual(errors, [], header);
+    assert.equal(rows[0].moq, 300, header);
+  }
+});
+
+test('MOQ is configured as optional, so it cannot become a required column by accident', () => {
+  assert.deepEqual(DEFAULTS.grnColsOptional, ['MOQ']);
+  assert.ok(!DEFAULTS.grnCols.includes('MOQ'),
+    'putting MOQ in grnCols would reject every export produced before the rule');
 });

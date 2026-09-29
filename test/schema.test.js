@@ -217,6 +217,35 @@ test('grn_qty must be positive — BR-01 has no meaning from a zero base', { ski
   }
 });
 
+test('FR-3.5: an MOQ is either absent or positive', { skip }, async () => {
+  for (const [what, moq] of [['zero', 0], ['negative', -300]]) {
+    await refuses(`a ${what} MOQ`, {
+      sql: `INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, grn_qty, grn_date, moq)
+            VALUES ('L-M', 'B-T', 'S-T', 'INV-M', 'PART-M', 350, '2026-09-29', $1)`,
+      params: [moq], code: '23514', constraint: 'grn_lines_moq_check',
+    });
+  }
+  await accepts('the 300-against-350 case the rule was written for',
+    `INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, grn_qty, grn_date, moq)
+     VALUES ('L-M', 'B-T', 'S-T', 'INV-M', 'PART-M', 350, '2026-09-29', 300)`);
+  await accepts('no MOQ at all, which is every line that predates the rule',
+    `INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, grn_qty, grn_date, moq)
+     VALUES ('L-M', 'B-T', 'S-T', 'INV-M', 'PART-M', 350, '2026-09-29', NULL)`);
+});
+
+test('an MOQ that would print thousands of labels is refused by the database too', { skip }, async () => {
+  // The import names the row first; this is the backstop. Without it a single
+  // mistyped cell builds a PDF a page at a time until the process dies.
+  await refuses('an MOQ of 1 against 400,000', {
+    sql: `INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, grn_qty, grn_date, moq)
+          VALUES ('L-M', 'B-T', 'S-T', 'INV-M', 'PART-M', 400000, '2026-09-29', 1)`,
+    code: '23514', constraint: 'grn_lines_moq_label_count',
+  });
+  await accepts('exactly the 500-label limit',
+    `INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, grn_qty, grn_date, moq)
+     VALUES ('L-M', 'B-T', 'S-T', 'INV-M', 'PART-M', 500, '2026-09-29', 1)`);
+});
+
 test('a GRN line cannot exist without its batch, and dies with it', { skip }, async () => {
   await refuses('a line pointing at no batch', {
     sql: `INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, grn_qty, grn_date)
@@ -587,4 +616,46 @@ test('--reset reproduces the demo shift exactly', { skip }, async () => {
   const after = await fingerprint();
   assert.deepEqual(after, before,
     'the seed is not deterministic — the Flutter build can no longer be compared against the approved prototype');
+});
+
+test('FR-3.5: the seed demonstrates the split, and the rule agrees with the data', { skip }, async () => {
+  const { labelUnits } = await import('../src/services/labels.js');
+
+  const withMoq = await many(
+    'SELECT id, part_no, grn_qty, moq FROM grn_lines WHERE moq IS NOT NULL ORDER BY part_no');
+  assert.ok(withMoq.length >= 4, 'the demo should show more than one shape of split');
+
+  /* The case the rule was written from: MOQ 300, GRN 350 → 300 then 50. Found
+     by its quantities rather than by part number, because the same part is
+     generated into both batches — each one restarts the parts pool — and the
+     08-Sep copy carries a different GRN quantity. */
+  const mfs = withMoq.find((l) => Number(l.grn_qty) === 350 && Number(l.moq) === 300);
+  assert.ok(mfs, 'the seed no longer demonstrates the 350-against-300 split');
+  assert.deepEqual(labelUnits(mfs).map((u) => u.label_qty), [300, 50]);
+
+  // Every seeded MOQ must be one the database and the splitter both accept.
+  for (const l of withMoq) {
+    const units = labelUnits(l);
+    const total = units.reduce((s, u) => s + u.label_qty, 0);
+    assert.equal(Math.round(total * 100), Math.round(Number(l.grn_qty) * 100),
+      `${l.part_no}: the labels do not add up to the GRN quantity`);
+    assert.ok(units.length <= 500, `${l.part_no} would print ${units.length} labels`);
+  }
+
+  // 90210-ABX is the fixture the QR decoder is proved against, so it must stay
+  // unsplit or that test is checking a payload nothing prints.
+  const abx = await one(`SELECT moq FROM grn_lines WHERE part_no = '90210-ABX'`);
+  assert.equal(abx.moq, null);
+});
+
+test('FR-3.5: lines without an MOQ still print exactly one label', { skip }, async () => {
+  const { labelUnits } = await import('../src/services/labels.js');
+  const plain = await many('SELECT id, grn_qty, moq FROM grn_lines WHERE moq IS NULL');
+  assert.ok(plain.length > 30, 'most of the demo shift should be unsplit');
+  for (const l of plain) {
+    const units = labelUnits(l);
+    assert.equal(units.length, 1, `${l.id} split without an MOQ`);
+    assert.equal(units[0].label_qty, Number(l.grn_qty));
+    assert.equal(units[0].label_of, 1);
+  }
 });

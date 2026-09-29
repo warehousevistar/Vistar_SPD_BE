@@ -31,12 +31,22 @@ const FIELD_OF = {
   'vendor code / name': 'vendor',
   'grn date': 'grn_date',
   'date': 'grn_date',
+  'moq': 'moq',
+  'min order qty': 'moq',
+  'minimum order quantity': 'moq',
+  'pack size': 'moq',
+  'standard pack': 'moq',
 };
 
 const norm = (s) => String(s ?? '').trim().toLowerCase().replace(/\s+/g, ' ');
 
 /** A part number of letters, digits, dashes and dots — the SAP convention. */
 const PART_RE = /^[A-Z0-9][A-Z0-9\-./]{2,39}$/i;
+
+/** FR-3.5 — the most labels one GRN line may split into. Mirrored by the
+    grn_lines_moq_label_count constraint, which is the backstop if a row ever
+    reaches the table without passing through here. */
+const MAX_LABELS_PER_LINE = 500;
 
 function parseCsv(buf) {
   const text = buf.toString('utf8').replace(/^﻿/, '');
@@ -118,7 +128,7 @@ function toIsoDate(v) {
  *   reason for everything rejected. A missing required column is reported with
  *   row `'header'`, exactly as the prototype's error file does.
  */
-export async function parseGrnFile({ buffer, filename, requiredCols, defaultGrnDate }) {
+export async function parseGrnFile({ buffer, filename, requiredCols, optionalCols = [], defaultGrnDate }) {
   const raw = /\.csv$/i.test(filename) ? parseCsv(buffer) : await parseXlsx(buffer);
   if (!raw.length) throw badRequest(`${filename} is empty — nothing to import (FR-1.3)`);
 
@@ -172,6 +182,7 @@ export async function parseGrnFile({ buffer, filename, requiredCols, defaultGrnD
     const vendor = cell('vendor');
     const qtyRaw = cell('grn_qty');
     const dateRaw = r[map.grn_date];
+    const moqRaw = map.moq === undefined ? '' : cell('moq');
 
     const rowErrors = [];
     if (!invoice) rowErrors.push({ column: 'Invoice No.', value: invoice, error: 'Mandatory value blank' });
@@ -185,6 +196,26 @@ export async function parseGrnFile({ buffer, filename, requiredCols, defaultGrnD
     }
     const iso = toIsoDate(dateRaw) ?? defaultGrnDate;
     if (!iso) rowErrors.push({ column: 'GRN Date', value: String(dateRaw ?? ''), error: 'Date not recognised' });
+
+    /* FR-3.5 — MOQ is optional, so a blank is not an error. A value that is
+       present but unusable is, because silently dropping it would print one
+       label for the whole quantity and nobody would know the split was lost. */
+    let moq = null;
+    if (moqRaw) {
+      const m = Number(String(moqRaw).replace(/,/g, ''));
+      const q = Number(String(qtyRaw).replace(/,/g, ''));
+      if (!Number.isFinite(m)) rowErrors.push({ column: 'MOQ', value: moqRaw, error: 'Not a number' });
+      else if (m <= 0) rowErrors.push({ column: 'MOQ', value: moqRaw, error: 'Must be greater than zero' });
+      else if (Number.isFinite(q) && q / m > MAX_LABELS_PER_LINE) {
+        // Almost always an MOQ of 1 where 100 was meant. Saying how many labels
+        // it would print is what makes the mistake obvious (NFR-4.2).
+        rowErrors.push({
+          column: 'MOQ',
+          value: moqRaw,
+          error: `Would print ${Math.ceil(q / m)} labels for this line; the limit is ${MAX_LABELS_PER_LINE}`,
+        });
+      } else moq = m;
+    }
 
     const key = `${invoice}|${part}`;
     if (!rowErrors.length && seen.has(key)) {
@@ -205,6 +236,7 @@ export async function parseGrnFile({ buffer, filename, requiredCols, defaultGrnD
       grn_qty: Number(String(qtyRaw).replace(/,/g, '')),
       vendor,
       grn_date: iso,
+      moq,
       source_row: rowNo,
     });
   }

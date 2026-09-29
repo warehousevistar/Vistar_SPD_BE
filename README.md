@@ -6,9 +6,10 @@ in [Vistar_SPD_FE](https://github.com/warehousevistar/Vistar_SPD_FE).
 
 The system digitises the SPD pre-packing cycle end to end: the SAP GRN export is
 uploaded once, validated column by column and displayed invoice- and
-part-number-wise; ID labels are generated and printed from that data; lines are
-allocated to packing tables; table members start and submit packing with the
-times captured for them; packed and pending quantities reconcile in real time;
+part-number-wise; ID labels are generated and printed from that data, split by
+MOQ where the part has one; lines are allocated to packing tables; table members
+start and submit packing with the times captured for them; packed and pending
+quantities reconcile in real time;
 exceptions are flagged for the Supervisor; hourly reports are generated and
 emailed; and the MIS is written automatically the moment the shift is finalised.
 
@@ -154,7 +155,7 @@ All routes are under `/api`. Everything except `/api/health`,
 |---|---|
 | `GET /lines` | invoice/part listing with live packed and pending (FR-2) |
 | `GET /lines/:id` | one line with its transactions, exceptions and allocations |
-| `GET /labels/:lineId/preview` | the label's fields, QR modules and barcode widths |
+| `GET /labels/:lineId/preview` | every label the line prints (FR-3.5), each with its own quantity, QR modules and barcode widths |
 | `POST /labels/:lineId/print` | logs the print; a reprint needs a reason (BR-09) |
 | `GET /labels/sheet.pdf` | the printable sheet (FR-3.2) |
 | `GET /labels/log` | the print log |
@@ -186,6 +187,34 @@ All routes are under `/api`. Everything except `/api/health`,
 | `GET /audit` | NFR-3.3 |
 
 ## Notes
+
+- **FR-3.5 — the MOQ label split.** A GRN line is printed as one label per MOQ
+  pack plus a remainder: 350 against an MOQ of 300 is a 300 label and a 50
+  label, because that is how the material leaves the table. Each label carries
+  its own quantity, and therefore its own QR — a scanner pointed at the 50-unit
+  pouch has to read 50. The index is deliberately *not* in the payload: the
+  encoder's budget is 26 bytes and a typical payload already uses 23, so a
+  `|1/2` suffix would be silently truncated; two packs of the same size are
+  interchangeable anyway, and it is the printed "1 of 2" that tells them apart.
+  The GRN quantity stays on the label beside the pack quantity, so FR-3.1 is
+  still satisfied.
+
+  MOQ arrives in the **MOQ** column of the SAP export. It is *optional*
+  (`grnColsOptional`, not `grnCols`): making it required would reject every
+  export produced before the rule existed, and a line without one prints the
+  single whole-quantity label it always did. A value that is present but
+  unusable is a row error rather than a silent `null`, because dropping it would
+  print one label where two were needed and nobody would know.
+
+  `splitByMoq` arithmetic runs in hundredths. Quantities are `NUMERIC(14,2)`,
+  and a decimal MOQ divided in floating point leaves dust in the *remainder* —
+  the one label a supervisor is least likely to re-check.
+
+  A mistyped MOQ (1 where 100 was meant) would turn one line into thousands of
+  labels and build the sheet a page at a time in memory. The import refuses it
+  by row and column, naming how many labels it would have printed, and
+  `grn_lines_moq_label_count` is the backstop for anything reaching the table
+  another way.
 
 - **NUMERIC and DATE parsing.** `pg` returns `numeric` as a string and `date` as
   a local-midnight `Date`; both are overridden in `db/index.js`. The date one is

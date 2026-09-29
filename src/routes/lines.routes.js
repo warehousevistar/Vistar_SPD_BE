@@ -5,7 +5,7 @@ import { wrap, notFound, badRequest } from '../middleware/error.js';
 import { shiftLines, lineById, shiftTxns } from '../lib/compute.js';
 import { settings } from '../lib/settings.js';
 import { audit } from '../lib/audit.js';
-import { buildLabelPdf, labelPayload, qrModules, barcodeWidths } from '../services/labels.js';
+import { buildLabelPdf, labelPayload, labelUnits, qrModules, barcodeWidths } from '../services/labels.js';
 
 export const lineRoutes = Router();
 lineRoutes.use(requireAuth);
@@ -45,13 +45,29 @@ lineRoutes.get('/labels/:lineId/preview', canRead, wrap(async (req, res) => {
   const line = await lineById(req.params.lineId);
   if (!line) throw notFound('No such GRN line');
   const cfg = await settings();
-  const payload = labelPayload(line);
+  /* FR-3.5 — a line with an MOQ prints one label per pack plus a remainder, so
+     the preview has to show each of them: the quantity, and therefore the QR,
+     differs between them. A line without an MOQ yields exactly one, which is
+     the FR-3.1 label unchanged. */
+  const labels = labelUnits(line).map((u) => {
+    const payload = labelPayload(u);
+    return {
+      index: u.label_index,
+      of: u.label_of,
+      qty: u.label_qty,
+      payload,
+      qr: qrModules(payload),
+      barcode: barcodeWidths(u.part_no),
+    };
+  });
   res.json({
     line,
     template: cfg.labelTpl,
-    payload,
-    qr: qrModules(payload),
-    barcode: barcodeWidths(line.part_no),
+    labels,
+    // The first label's fields, kept flat for callers that predate the split.
+    payload: labels[0].payload,
+    qr: labels[0].qr,
+    barcode: labels[0].barcode,
     alreadyPrinted: Number(line.label_copies ?? 0) > 0,
   });
 }));

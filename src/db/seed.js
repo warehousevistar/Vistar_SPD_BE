@@ -68,6 +68,25 @@ const PARTS_POOL = [
 ];
 
 /** Builds the GRN lines exactly as the prototype's buildGrn() does. */
+/* FR-3.5 — the minimum order quantity a part is packed in. In a real import
+   this arrives in the MOQ column of the SAP export; here it is fixed per part
+   so the demo shows every shape of the split without disturbing a single
+   generated quantity, and so the approved prototype's figures still match.
+
+     76621-MFS  350 ÷ 300  →  300 + 50, the two-label case
+     82111-WHM  360 ÷ 100  →  100 + 100 + 100 + 60
+     48231-CSP  300 ÷ 300  →  one label, the exact-multiple boundary
+     67861-WSR  140 ÷ 200  →  one label of 140, MOQ above the quantity
+
+   90210-ABX is deliberately left without one: its label payload is the fixture
+   the QR decoder in test/labels.test.js is proved against. */
+const MOQ_BY_PART = {
+  '76621-MFS': 300,
+  '82111-WHM': 100,
+  '48231-CSP': 300,
+  '67861-WSR': 200,
+};
+
 function buildGrnLines() {
   const lines = [];
   let ln = 1;
@@ -81,6 +100,7 @@ function buildGrnLines() {
         lines.push({
           id: 'L' + pad(ln++, 4), batch, shift, inv, part: p[0], desc: p[1], uom: p[2],
           qty: ri(4, 40) * 10, vendor: pick(VENDORS), grnDate: dateStr,
+          moq: MOQ_BY_PART[p[0]] ?? null,
         });
       }
     }
@@ -98,6 +118,7 @@ const CONFIG_ROWS = {
   emails: ['rajesh.menon@vistarlogitek.com', 'spd.shiftreport@vistarlogitek.com'],
   labelTpl: 'SPD Standard 100×60',
   grnCols: ['Invoice No.', 'Part Number', 'Part Description', 'GRN Quantity', 'UOM', 'Vendor', 'GRN Date'],
+  grnColsOptional: ['MOQ'],
 };
 
 /* Demo credentials. Documented in the README — the first thing a real
@@ -266,9 +287,9 @@ async function seed({ reset = false } = {}) {
         [b.id, b.file, b.shift, b.ts, b.by, rows, b.rejected]);
     }
     for (const l of lines) {
-      await q(`INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, part_desc, uom, grn_qty, vendor, grn_date)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`,
-        [l.id, l.batch, l.shift, l.inv, l.part, l.desc, l.uom, l.qty, l.vendor, l.grnDate]);
+      await q(`INSERT INTO grn_lines (id, batch_id, shift_id, invoice_no, part_no, part_desc, uom, grn_qty, vendor, grn_date, moq)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [l.id, l.batch, l.shift, l.inv, l.part, l.desc, l.uom, l.qty, l.vendor, l.grnDate, l.moq]);
     }
     for (const a of allocs) {
       await q('INSERT INTO allocations (id, line_id, table_no, qty, reason, allocated_at, allocated_by) VALUES ($1,$2,$3,$4,$5,$6,$7)',
