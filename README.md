@@ -92,14 +92,16 @@ npm run reset      # wipe the operational tables and seed again
 npm start          # serve on PORT (default 4100)
 npm run dev        # the same, with --watch
 
-npm run test:unit  # lib/ and services/ — no database or server needed
+npm run test:unit  # lib/, services/ and the schema — no server needed
 npm run test:api   # end-to-end against a running server
 npm test           # both
 ```
 
 `test:unit` covers the logic a shift only reaches occasionally: the GRN import's
 rejection paths, the reconciliation precedence, the submission thresholds, CSV
-escaping, and the label encoders.
+escaping, and the label encoders. The schema tests in it want a PostgreSQL to
+talk to and skip themselves with a reason when there is none, so the command
+still runs anywhere.
 
 **The QR encoder is checked by decoding it.** `services/labels.js` writes the
 bit stream, Reed-Solomon, module placement and masking by hand, and nothing
@@ -110,6 +112,20 @@ specification's reading order, proves it against a matrix from an independent
 implementation (the Dart `qr` package, captured by
 `frontend/tool/qr_reference.dart`), and then reads our own codes back to their
 payloads.
+
+**The constraints are checked by breaking them.** Reading `schema.sql` tells you
+what a CHECK is meant to say, not whether PostgreSQL agrees — a subtly wrong
+boolean, a partial unique index whose `WHERE` never matches, a foreign key that
+cascades where it should refuse all read correctly and none of them bite. So
+`test/schema.test.js` hands the database a row that breaks each rule and insists
+on a refusal, checking the SQLSTATE *and* the constraint name so a probe cannot
+pass because some other rule fired first. It then checks the seed as data:
+referentially sound, BR-01 satisfied on all 42 lines, exactly one deliberate
+over-pack carrying its Excess Entry, the MIS agreeing with the transactions it
+was taken from, and `--reset` reproducing the shift byte for byte. Everything
+runs against a scratch `vistar_spd_test` database, which the suite creates and
+rebuilds itself; set `SPD_TEST_DB` to change the name, which must end in
+`_test`.
 
 ## API
 
