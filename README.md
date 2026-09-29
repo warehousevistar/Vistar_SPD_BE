@@ -113,6 +113,7 @@ All routes are under `/api`. Everything except `/api/health`,
 | `GET /shifts` · `POST /shifts` | the shift list; creating one |
 | `GET /grn/batches` | import history (FR-1.6) |
 | `POST /grn/upload` | multipart `file` + `shiftId`; `confirm=true` + `reason` overrides BR-08 |
+| `POST /grn/errors.csv` | the rejected-row list as a downloadable file; post back the `errors` array from an upload response. The console builds this file itself from the rows it already holds, so this exists for other clients. |
 | `DELETE /grn/batches/:id` | only while nothing has been packed against it |
 
 ### Lines & labels

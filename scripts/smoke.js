@@ -219,6 +219,19 @@ async function main() {
     up.status === 201 && upData.errors?.length === 3 && upData.imported === 1,
     upData.errors?.map((e) => `row ${e.row}/${e.column}`).join(', '));
 
+  /* The console builds the rejected-row file itself, so this endpoint has no
+     caller in the app — which is exactly why it needs a check of its own. An
+     endpoint nothing exercises is where the next contract drift hides. */
+  const errCsv = await fetch(`${API}/grn/errors.csv`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${T}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ errors: upData.errors ?? [] }),
+  });
+  const errCsvBody = await errCsv.text();
+  check('rejected rows download as CSV (FR-1.3)',
+    errCsv.status === 200 && errCsvBody.includes('Row') && errCsvBody.includes('Error'),
+    `${errCsvBody.split('\r\n').length - 1} row(s)`);
+
   const dup = new FormData();
   dup.append('file', new Blob([badCsv], { type: 'text/csv' }), 'SMOKE_GRN.csv');
   dup.append('shiftId', SHIFT);
