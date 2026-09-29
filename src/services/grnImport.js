@@ -132,6 +132,16 @@ export async function parseGrnFile({ buffer, filename, requiredCols, optionalCol
   const raw = /\.csv$/i.test(filename) ? parseCsv(buffer) : await parseXlsx(buffer);
   if (!raw.length) throw badRequest(`${filename} is empty — nothing to import (FR-1.3)`);
 
+  /* NFR-6.1 — the configured mapping decides which columns are read, so a
+     column dropped from the configuration is genuinely ignored. Recognising a
+     header merely because FIELD_OF knows the spelling would make the
+     configuration decorative: removing MOQ from it would change nothing, and
+     the Masters & Config screen would be offering a setting that does not
+     work. */
+  const allowed = new Set(
+    [...requiredCols, ...optionalCols].map((c) => FIELD_OF[norm(c)]).filter(Boolean),
+  );
+
   /* FR-1.2 — locate the header row. SAP exports sometimes carry a title line
      above it, so the first row that maps at least three known headers wins
      rather than assuming row 1. */
@@ -141,7 +151,7 @@ export async function parseGrnFile({ buffer, filename, requiredCols, optionalCol
     const candidate = {};
     raw[i].forEach((h, c) => {
       const f = FIELD_OF[norm(h)];
-      if (f && candidate[f] === undefined) candidate[f] = c;
+      if (f && allowed.has(f) && candidate[f] === undefined) candidate[f] = c;
     });
     if (Object.keys(candidate).length >= 3) { headerIdx = i; map = candidate; break; }
   }

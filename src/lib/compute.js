@@ -1,4 +1,5 @@
 import { all, get } from '../db/index.js';
+import { labelUnits } from '../services/labels.js';
 
 /* ============================================================================
    Reconciliation engine — section 4.7 and the business rules of section 10.
@@ -79,6 +80,10 @@ export async function shiftLines(shiftId, { invoice = '', vendor = '', status = 
       ...l,
       pending: Number(l.grn_qty) - Number(l.packed),
       status: lineStatus(l),
+      // FR-3.5 — how many labels this line actually prints. Derived from the
+      // one implementation of the split, so the count a Supervisor sizes label
+      // stock from cannot drift from what the sheet produces.
+      label_count: labelUnits(l).length,
     }))
     .filter((l) => !invoice || l.invoice_no === invoice)
     .filter((l) => !vendor || l.vendor === vendor)
@@ -115,7 +120,7 @@ export async function lineById(lineId) {
   );
   if (!rows.length) return null;
   const l = rows[0];
-  return { ...l, pending: Number(l.grn_qty) - Number(l.packed), status: lineStatus(l) };
+  return { ...l, pending: Number(l.grn_qty) - Number(l.packed), status: lineStatus(l), label_count: labelUnits(l).length };
 }
 
 /** Headline figures for a shift — the dashboard tiles and the MIS metrics. */

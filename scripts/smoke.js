@@ -217,6 +217,21 @@ async function main() {
     const pages = (splitPdf.buf.toString('latin1').match(/\/Type\s*\/Page[^s]/g) ?? []).length;
     check('the printed sheet carries one page per label (FR-3.2/3.5)',
       splitPdf.status === 200 && pages === expected, `${pages} page(s), expected ${expected}`);
+
+    /* The console's "Print sheet · N" is the sum of these, and it is what a
+       Supervisor sizes label stock from. Three numbers derived in three places
+       — the lines list, the preview and the PDF — have to be the same number,
+       or the console promises a sheet the printer does not produce. */
+    check('the line list reports the same label count as the preview and the sheet (FR-3.5)',
+      Number(splitLine.label_count) === ls.length && ls.length === pages,
+      `lines ${splitLine.label_count} · preview ${ls.length} · pages ${pages}`);
+
+    const sheetTotal = lines.data.lines.reduce((n, l) => n + Number(l.label_count ?? 1), 0);
+    const allPdf = await call('GET', `/labels/sheet.pdf?shiftId=${SHIFT}`, { token: T, raw: true });
+    const allPages = (allPdf.buf.toString('latin1').match(/\/Type\s*\/Page[^s]/g) ?? []).length;
+    check('the whole-shift sheet matches the count the console shows (FR-3.5)',
+      allPages === sheetTotal,
+      `${lines.data.lines.length} lines → console says ${sheetTotal} labels, sheet has ${allPages} pages`);
   }
 
   /* ---- FR-8 hourly ---- */
@@ -269,6 +284,22 @@ async function main() {
   /* ---- FR-13.2 config validation ---- */
   const badCfg = await call('PUT', '/config', { token: T, body: { threshold: 250 } });
   check('an out-of-range threshold is refused with a specific message (NFR-4.2)', badCfg.status === 400, badCfg.data.error);
+
+  /* NFR-6.1 says the column mapping is configuration rather than code. That is
+     only true if a column removed from it is actually ignored — the setting
+     round-tripped happily for a while without changing what the importer read. */
+  const cfgNow = await call('GET', '/config', { token: T });
+  const optional = cfgNow.data.config?.grnColsOptional;
+  check('the optional column list survives the round trip (NFR-6.1)',
+    cfgNow.status === 200 && Array.isArray(optional) && optional.includes('MOQ'),
+    `grnColsOptional = ${JSON.stringify(optional)}`);
+
+  const clearedCfg = await call('PUT', '/config', { token: T, body: { grnColsOptional: [] } });
+  const clearedBack = await call('GET', '/config', { token: T });
+  check('an optional column can be removed and stays removed (NFR-6.1)',
+    clearedCfg.status === 200 && (clearedBack.data.config?.grnColsOptional ?? ['x']).length === 0,
+    JSON.stringify(clearedBack.data.config?.grnColsOptional));
+  await call('PUT', '/config', { token: T, body: { grnColsOptional: optional ?? ['MOQ'] } });
 
   /* ---- NFR-3.3 audit trail ---- */
   const audit = await call('GET', '/audit?limit=50', { token: T });

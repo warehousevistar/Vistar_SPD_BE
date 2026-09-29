@@ -94,6 +94,7 @@ const parse = (csv, opts = {}) => parseGrnFile({
   buffer: Buffer.from(csv, 'utf8'),
   filename: 'GRN.csv',
   requiredCols: DEFAULTS.grnCols,
+  optionalCols: DEFAULTS.grnColsOptional,
   defaultGrnDate: '2026-09-09',
   ...opts,
 });
@@ -354,9 +355,12 @@ test('the QR payload carries the label quantity, not the line quantity', () => {
   assert.equal(labelPayload(labelUnits(line(270, null))[0]), '76621-MFS|INV-77001|270');
 });
 
-test('a split payload still fits the QR budget, so nothing is truncated', () => {
-  // qrMatrix truncates above 26 bytes rather than refusing, which would corrupt
-  // the code silently. This is why the index is not encoded in the payload.
+test('a split payload still fits a version-2 QR, so the code keeps its size', () => {
+  /* The encoder grows the symbol to fit rather than truncating, so a longer
+     payload is no longer a correctness problem — but a split payload is only a
+     few bytes longer than the unsplit one, and staying inside version 2's 26
+     bytes means the split prints the same 25×25 code every label has always
+     had. labels.test.js is where the encoder's own limits are pinned down. */
   for (const u of labelUnits(line(350, 300))) {
     assert.ok(Buffer.byteLength(labelPayload(u)) <= 26,
       `${labelPayload(u)} is ${Buffer.byteLength(labelPayload(u))} bytes`);
@@ -427,4 +431,31 @@ test('MOQ is configured as optional, so it cannot become a required column by ac
   assert.deepEqual(DEFAULTS.grnColsOptional, ['MOQ']);
   assert.ok(!DEFAULTS.grnCols.includes('MOQ'),
     'putting MOQ in grnCols would reject every export produced before the rule');
+});
+
+test('an optional column dropped from the configuration is genuinely ignored', () => {
+  // NFR-6.1 is the claim that the mapping is configuration rather than code.
+  // Reading MOQ merely because FIELD_OF knows the spelling would make the
+  // Masters & Config screen offer a setting that does nothing — which is what
+  // it did until the audit of this feature went looking for it.
+  return (async () => {
+    const csv = [
+      `${HEADER},MOQ`,
+      'INV-1,76621-MFS,Mount Foot,350,NOS,DynaFast,09-Sep-2026,300',
+    ].join('\n');
+
+    const configured = await parse(csv);
+    assert.equal(configured.rows[0].moq, 300, 'MOQ is configured, so it must be read');
+
+    const dropped = await parse(csv, { optionalCols: [] });
+    assert.deepEqual(dropped.errors, [], 'dropping MOQ must not make the file invalid');
+    assert.equal(dropped.rows[0].moq, null, 'MOQ is no longer configured, so it must be ignored');
+    assert.equal(dropped.rows[0].grn_qty, 350, 'and the rest of the row still imports');
+  })();
+});
+
+test('a line whose MOQ was ignored prints one label, not a split', async () => {
+  const csv = [`${HEADER},MOQ`, 'INV-1,76621-MFS,Mount Foot,350,NOS,DynaFast,09-Sep-2026,300'].join('\n');
+  const { rows } = await parse(csv, { optionalCols: [] });
+  assert.deepEqual(labelUnits(rows[0]).map((u) => u.label_qty), [350]);
 });
