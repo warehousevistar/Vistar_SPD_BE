@@ -13,7 +13,9 @@
     "seed": "node src/db/seed.js",
     "reset": "node src/db/seed.js --reset",
     "smoke": "node scripts/smoke.js",
-    "test": "node scripts/smoke.js"
+    "test:unit": "node --test",
+    "test:api": "node scripts/smoke.js",
+    "test": "node --test && node scripts/smoke.js"
   },
   "dependencies": {
     "bcryptjs": "^3.0.2",

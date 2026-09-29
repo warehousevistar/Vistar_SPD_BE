@@ -91,8 +91,25 @@ npm run seed       # load the demo shift (skips if the database already has user
 npm run reset      # wipe the operational tables and seed again
 npm start          # serve on PORT (default 4100)
 npm run dev        # the same, with --watch
-npm test           # end-to-end smoke test against a running server
+
+npm run test:unit  # lib/ and services/ — no database or server needed
+npm run test:api   # end-to-end against a running server
+npm test           # both
 ```
+
+`test:unit` covers the logic a shift only reaches occasionally: the GRN import's
+rejection paths, the reconciliation precedence, the submission thresholds, CSV
+escaping, and the label encoders.
+
+**The QR encoder is checked by decoding it.** `services/labels.js` writes the
+bit stream, Reed-Solomon, module placement and masking by hand, and nothing
+downstream would notice if that were subtly wrong — the label prints, it looks
+like a QR code, and the fault only appears when someone on the floor points a
+scanner at it. So `test/labels.test.js` carries a decoder written from the
+specification's reading order, proves it against a matrix from an independent
+implementation (the Dart `qr` package, captured by
+`frontend/tool/qr_reference.dart`), and then reads our own codes back to their
+payloads.
 
 ## API
 

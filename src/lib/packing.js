@@ -182,4 +182,3 @@ export async function previewSubmission({ grnQty, packed, qty, threshold }) {
   return { tone: 'ok', title: 'Looks good', message: `Pending after submit: ${nf(grn - cum)}.` };
 }
 
-export { nf, durTxt };

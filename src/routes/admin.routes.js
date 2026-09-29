@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import bcrypt from 'bcryptjs';
-import { all, get, run, tx } from '../db/index.js';
+import { all, get, tx } from '../db/index.js';
 import { requireAuth, canRead, canSupervise, isAdmin } from '../middleware/auth.js';
 import { wrap, badRequest, conflict, notFound } from '../middleware/error.js';
 import { settings, saveSettings, DEFAULTS } from '../lib/settings.js';

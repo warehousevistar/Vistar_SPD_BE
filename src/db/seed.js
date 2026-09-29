@@ -11,7 +11,7 @@
  *   node src/db/seed.js --reset   wipe the operational tables and seed again
  */
 import bcrypt from 'bcryptjs';
-import { pool, migrate, get, run, tx } from './index.js';
+import { pool, migrate, get, tx } from './index.js';
 import { pad } from '../lib/ids.js';
 
 /* ---- the prototype's deterministic generator, ported verbatim ---------- */

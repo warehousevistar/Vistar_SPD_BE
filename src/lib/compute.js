@@ -118,13 +118,6 @@ export async function lineById(lineId) {
   return { ...l, pending: Number(l.grn_qty) - Number(l.packed), status: lineStatus(l) };
 }
 
-/** Packed quantity for a single line — the BR-01 left-hand side. */
-export async function packedQty(lineId, q = null) {
-  const sql = `SELECT COALESCE(SUM(qty), 0) AS packed FROM packing_txns WHERE line_id = $1 AND status <> 'Started'`;
-  const row = q ? (await q(sql, [lineId]))[0] : await get(sql, [lineId]);
-  return Number(row?.packed ?? 0);
-}
-
 /** Headline figures for a shift — the dashboard tiles and the MIS metrics. */
 export async function shiftStats(shiftId) {
   const row = await get(
@@ -267,8 +260,3 @@ export async function shiftTxns(shiftId, { invoice = '', tableNo = '', memberId 
   );
 }
 
-/** True when the shift is finalised and member entry is locked (BR-06). */
-export async function shiftLocked(shiftId) {
-  const s = await get('SELECT status FROM shifts WHERE id = $1', [shiftId]);
-  return s?.status === 'Finalised';
-}
