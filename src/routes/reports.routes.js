@@ -40,8 +40,17 @@ const durTxt = (ms) => {
 reportRoutes.get('/hourly', canRead, wrap(async (req, res) => {
   const { shiftId } = req.query;
   if (!shiftId) throw badRequest('shiftId is required');
+  /* The shift label is joined here for the same reason /hourly/:id joins it:
+     the console puts it in the report's email subject line (FR-8.2). Without
+     it the subject read "Hourly Status ·  · 10:58" — the console reads
+     shift_label, every getter falls back to '', and a missing field shows up
+     as a gap in a string rather than as an error anywhere. */
   const reports = await all(
-    'SELECT * FROM hourly_reports WHERE shift_id = $1 ORDER BY generated_at DESC',
+    `SELECT h.*, s.label AS shift_label
+       FROM hourly_reports h
+       JOIN shifts s ON s.id = h.shift_id
+      WHERE h.shift_id = $1
+      ORDER BY h.generated_at DESC`,
     [shiftId],
   );
   const cfg = await settings();
