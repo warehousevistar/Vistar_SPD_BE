@@ -1,14 +1,42 @@
 import { Router } from 'express';
-import { all, get, run } from '../db/index.js';
+import { all, get, run, tx } from '../db/index.js';
 import { requireAuth, canRead, canSupervise } from '../middleware/auth.js';
-import { wrap, notFound, badRequest } from '../middleware/error.js';
+import { wrap, notFound, badRequest, conflict } from '../middleware/error.js';
 import { shiftLines, lineById, shiftTxns } from '../lib/compute.js';
 import { settings } from '../lib/settings.js';
 import { audit } from '../lib/audit.js';
-import { buildLabelPdf, labelPayload, labelUnits, qrModules, barcodeWidths } from '../services/labels.js';
+import { nextId } from '../lib/ids.js';
+import { buildLabelPdf, labelPayload, labelUnits, qrModules } from '../services/labels.js';
 
 export const lineRoutes = Router();
 lineRoutes.use(requireAuth);
+
+const nf = (n) => Number(n).toLocaleString('en-IN');
+
+/**
+ * FR-3.1 — a GRN line with the two things the label prints that the line does
+ * not itself hold: who is packing it and on what day.
+ *
+ * Neither is known when the label is printed. The ID Labels screen runs before
+ * table allocation and long before anyone starts, so the best the sheet can do
+ * is name the members standing at the tables the line has been sent to, and
+ * the date of the shift it belongs to. A line not yet allocated prints neither,
+ * which is the honest answer — and the reason `buildLabelPdf` treats both as
+ * optional rather than expecting them.
+ *
+ * A line can now sit on several tables, so `packer` is aggregated: two names
+ * where the work is genuinely shared, and the label's own field width decides
+ * how much of that fits.
+ */
+const LABEL_COLUMNS = `
+  l.*,
+  (SELECT s.shift_date FROM shifts s WHERE s.id = l.shift_id) AS packed_on,
+  (SELECT STRING_AGG(DISTINCT u.name, ', ' ORDER BY u.name)
+     FROM allocations a
+     JOIN packing_tables pt ON pt.table_no = a.table_no
+     JOIN users u ON u.id = pt.member_id
+    WHERE a.line_id = l.id) AS packer
+  FROM grn_lines l`;
 
 /* ------------------------------------- FR-2.1/2.2 invoice & part listing --- */
 
@@ -35,7 +63,82 @@ lineRoutes.get('/lines/:id', canRead, wrap(async (req, res) => {
       WHERE a.line_id = $1 ORDER BY a.allocated_at`,
     [line.id],
   );
-  res.json({ line, txns, exceptions, allocations });
+  const adjustments = await all(
+    `SELECT j.*, u.name AS created_by_name FROM qty_adjustments j LEFT JOIN users u ON u.id = j.created_by
+      WHERE j.line_id = $1 ORDER BY j.created_at`,
+    [line.id],
+  );
+  res.json({ line, txns, exceptions, allocations, adjustments });
+}));
+
+/**
+ * BR-01 — closing out a remainder that will never be packed.
+ *
+ * Pending is GRN minus packed and is computed, never stored, so there is no
+ * "remaining quantity" field to edit. What a Supervisor is really saying when
+ * they close a line with five outstanding is *those five are not coming* —
+ * damaged, short-shipped, the wrong part in the box. So it is recorded as its
+ * own term with the reason attached, and neither of the other two is touched:
+ * grn_qty stays the figure SAP sent, and the member's 95 stays 95 rather than
+ * quietly becoming 100 on their productivity line.
+ *
+ * The sign is free, so a close-out on the wrong line is undone by entering its
+ * opposite rather than by deleting the record of it. What is not free is the
+ * result: a line can never end up with negative pending or more outstanding
+ * than it was received with.
+ */
+lineRoutes.post('/lines/:id/adjust', canSupervise, wrap(async (req, res) => {
+  const qty = Number(req.body?.qty);
+  const reason = String(req.body?.reason || '').trim();
+  if (!Number.isFinite(qty) || qty === 0) throw badRequest('Enter a quantity to write off');
+  if (!reason) throw badRequest('A quantity adjustment must record a reason');
+
+  const out = await tx(async (q) => {
+    const [line] = await q(
+      `SELECT l.*, s.status AS shift_status, s.label AS shift_label
+         FROM grn_lines l JOIN shifts s ON s.id = l.shift_id
+        WHERE l.id = $1 FOR UPDATE OF l`,
+      [req.params.id],
+    );
+    if (!line) throw notFound('No such GRN line');
+    if (line.shift_status === 'Finalised') {
+      throw conflict(`${line.shift_label} is finalised — reopen the shift to adjust quantities (BR-06)`);
+    }
+
+    const [sums] = await q(
+      `SELECT COALESCE((SELECT SUM(qty) FROM packing_txns WHERE line_id = $1 AND status <> 'Started'), 0) AS packed,
+              COALESCE((SELECT SUM(qty) FROM qty_adjustments WHERE line_id = $1), 0) AS adjusted`,
+      [line.id],
+    );
+    const grn = Number(line.grn_qty);
+    const packed = Number(sums.packed);
+    const was = Number(sums.adjusted);
+    const pending = grn - packed - was;
+    const now = pending - qty;
+
+    if (now < 0) {
+      throw badRequest(
+        `${nf(qty)} is more than the ${nf(pending)} ${line.uom} still outstanding on ${line.part_no}`,
+      );
+    }
+    if (now > grn - packed) {
+      throw badRequest(`That would leave more outstanding than the GRN quantity of ${nf(grn)} ${line.uom}`);
+    }
+
+    const id = await nextId('qty_adjustments', 'QA', 4, q);
+    await q(
+      'INSERT INTO qty_adjustments (id, line_id, qty, reason, created_by) VALUES ($1, $2, $3, $4, $5)',
+      [id, line.id, qty, reason, req.user.id],
+    );
+    await audit({
+      actorId: req.user.id, action: 'Quantity Adjustment', reference: line.part_no,
+      detail: `${line.invoice_no} · ${qty > 0 ? 'wrote off' : 'restored'} ${nf(Math.abs(qty))} ${line.uom} — ${reason}`,
+      before: `${nf(pending)} pending`, after: `${nf(now)} pending`,
+    }, q);
+    return { id, pending: now, adjusted: was + qty };
+  });
+
+  res.status(201).json(out);
 }));
 
 /* ------------------------------------------------------- FR-3 ID labels --- */
@@ -57,7 +160,6 @@ lineRoutes.get('/labels/:lineId/preview', canRead, wrap(async (req, res) => {
       qty: u.label_qty,
       payload,
       qr: qrModules(payload),
-      barcode: barcodeWidths(u.part_no),
     };
   });
   res.json({
@@ -67,7 +169,6 @@ lineRoutes.get('/labels/:lineId/preview', canRead, wrap(async (req, res) => {
     // The first label's fields, kept flat for callers that predate the split.
     payload: labels[0].payload,
     qr: labels[0].qr,
-    barcode: labels[0].barcode,
     alreadyPrinted: Number(line.label_copies ?? 0) > 0,
   });
 }));
@@ -129,12 +230,15 @@ lineRoutes.get('/labels/sheet.pdf', canSupervise, wrap(async (req, res) => {
   const cfg = await settings();
   let lines;
   if (only) {
-    const l = await get('SELECT * FROM grn_lines WHERE id = $1', [only]);
+    const l = await get(`SELECT ${LABEL_COLUMNS} WHERE l.id = $1`, [only]);
     if (!l) throw notFound('No such GRN line');
     lines = [l];
   } else {
     if (!shiftId) throw badRequest('shiftId is required');
-    lines = await all('SELECT * FROM grn_lines WHERE shift_id = $1 ORDER BY invoice_no, part_no', [shiftId]);
+    lines = await all(
+      `SELECT ${LABEL_COLUMNS} WHERE l.shift_id = $1 ORDER BY l.invoice_no, l.part_no`,
+      [shiftId],
+    );
     if (!lines.length) throw badRequest('This shift has no GRN lines to label yet');
   }
   const pdf = await buildLabelPdf(lines, { template: cfg.labelTpl });

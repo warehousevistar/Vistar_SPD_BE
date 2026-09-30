@@ -144,7 +144,7 @@ test('schema.sql applies to an empty database', { skip }, async () => {
   await pool.query(SCHEMA_SQL);
   const { n } = await one(
     `SELECT COUNT(*)::int AS n FROM information_schema.tables WHERE table_schema = 'public'`);
-  assert.equal(n, 13, 'the SRS section 7 data dictionary is 13 tables');
+  assert.equal(n, 14, 'the SRS section 7 data dictionary, plus qty_adjustments, is 14 tables');
 });
 
 test('schema.sql is idempotent — the server applies it on every boot', { skip }, async () => {
@@ -156,9 +156,14 @@ test('schema.sql is idempotent — the server applies it on every boot', { skip 
 });
 
 test('every table the SRS data dictionary names exists', { skip }, async () => {
+  /* The dictionary's thirteen, and qty_adjustments — which the SRS does not
+     name because BR-01 assumes pending always closes by packing. It does not:
+     a remainder that is damaged or short-shipped is written off instead, and
+     that has to be a record with a reason rather than an edit to one of the
+     other two terms. */
   const want = ['users', 'packing_tables', 'shifts', 'grn_batches', 'grn_lines', 'allocations',
     'packing_txns', 'exceptions', 'hourly_reports', 'mis_snapshots', 'labels_printed',
-    'audit_log', 'app_config'];
+    'audit_log', 'app_config', 'qty_adjustments'];
   const got = (await many(
     `SELECT table_name FROM information_schema.tables WHERE table_schema = 'public' ORDER BY table_name`))
     .map((r) => r.table_name);
@@ -171,11 +176,11 @@ test('every index the schema declares is actually present', { skip }, async () =
     'allocations_line_table_key', 'packing_txns_line_idx', 'packing_txns_member_idx',
     'packing_txns_table_idx', 'packing_txns_one_running_per_member', 'exceptions_line_idx',
     'hourly_reports_shift_idx', 'mis_snapshots_shift_idx', 'labels_printed_line_idx',
-    'audit_log_at_idx', 'audit_log_action_idx'];
+    'audit_log_at_idx', 'audit_log_action_idx', 'qty_adjustments_line_idx'];
   const got = new Set((await many(`SELECT indexname FROM pg_indexes WHERE schemaname = 'public'`))
     .map((r) => r.indexname));
   for (const ix of want) assert.ok(got.has(ix), `index ${ix} is missing`);
-  assert.equal(want.length, 18);
+  assert.equal(want.length, 19);
 });
 
 /* ======================================================================= */

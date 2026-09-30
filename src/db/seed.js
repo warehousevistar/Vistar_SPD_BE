@@ -130,7 +130,7 @@ async function seed({ reset = false } = {}) {
   await migrate();
 
   if (reset) {
-    await pool.query(`TRUNCATE audit_log, mis_snapshots, hourly_reports, exceptions, packing_txns,
+    await pool.query(`TRUNCATE audit_log, mis_snapshots, hourly_reports, exceptions, qty_adjustments, packing_txns,
                                labels_printed, allocations, grn_lines, grn_batches, shifts,
                                packing_tables, app_config, users RESTART IDENTITY CASCADE`);
     console.log('[seed] operational tables truncated');

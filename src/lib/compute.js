@@ -26,13 +26,30 @@ const PACKED_SQL = `
    GROUP BY t.line_id`;
 
 /**
+ * Quantity written off per line — the third term of BR-01.
+ *
+ * Kept apart from `packed` rather than added into it: 95 packed and 5 written
+ * off is not 100 packed, and a member's productivity is the work they did, not
+ * the remainder a Supervisor closed. So the two travel separately all the way
+ * to the screen, and only `pending` sees the sum.
+ */
+const ADJUSTED_SQL = `
+  SELECT j.line_id,
+         COALESCE(SUM(j.qty), 0) AS adjusted,
+         COUNT(*)                AS adjustments
+    FROM qty_adjustments j
+   GROUP BY j.line_id`;
+
+/**
  * Line status, matching the prototype's lineStatus() precedence exactly:
  * an open exception outranks everything, then fully packed, then any packed
  * quantity or a running transaction, then allocated, then pending.
  */
-export function lineStatus({ grn_qty, packed, open_exceptions, running, allocations }) {
+export function lineStatus({ grn_qty, packed, open_exceptions, running, allocations, adjusted = 0 }) {
   if (Number(open_exceptions) > 0) return 'Exception';
-  if (Number(packed) >= Number(grn_qty)) return 'Completed';
+  // A line whose remainder has been written off is finished with, the same as
+  // one packed to the last unit — that is the point of writing it off.
+  if (Number(packed) + Number(adjusted) >= Number(grn_qty)) return 'Completed';
   if (Number(packed) > 0 || Number(running) > 0) return 'In Progress';
   return Number(allocations) > 0 ? 'Allocated' : 'Pending';
 }
@@ -54,9 +71,12 @@ export async function shiftLines(shiftId, { invoice = '', vendor = '', status = 
             COALESCE(a.tables, ARRAY[]::text[]) AS tables,
             COALESCE(a.n, 0)        AS allocations,
             COALESCE(lp.copies, 0)  AS label_copies,
+            COALESCE(j.adjusted, 0) AS adjusted,
+            COALESCE(j.adjustments, 0) AS adjustments,
             COALESCE(m.members, ARRAY[]::text[]) AS member_ids
        FROM grn_lines l
        LEFT JOIN (${PACKED_SQL}) p ON p.line_id = l.id
+       LEFT JOIN (${ADJUSTED_SQL}) j ON j.line_id = l.id
        LEFT JOIN (SELECT line_id, ARRAY_AGG(DISTINCT member_id) AS members
                     FROM packing_txns WHERE status <> 'Started' GROUP BY line_id) m
               ON m.line_id = l.id
@@ -78,7 +98,7 @@ export async function shiftLines(shiftId, { invoice = '', vendor = '', status = 
   return rows
     .map((l) => ({
       ...l,
-      pending: Number(l.grn_qty) - Number(l.packed),
+      pending: Number(l.grn_qty) - Number(l.packed) - Number(l.adjusted),
       status: lineStatus(l),
       // FR-3.5 — how many labels this line actually prints. Derived from the
       // one implementation of the split, so the count a Supervisor sizes label
@@ -108,9 +128,21 @@ export async function lineById(lineId) {
             -- BR-09: the label dialog decides whether to demand a reprint
             -- reason from this. Leaving it out made every line look unprinted,
             -- so the dialog never asked and the print was then refused.
-            COALESCE(lp.copies, 0) AS label_copies
+            COALESCE(lp.copies, 0) AS label_copies,
+            COALESCE(j.adjusted, 0) AS adjusted,
+            COALESCE(j.adjustments, 0) AS adjustments,
+            -- FR-3.1 — what the label prints for packer and packing date. The
+            -- preview draws from the same two values the sheet does, so what a
+            -- Supervisor approves on screen is what the printer produces.
+            (SELECT s.shift_date FROM shifts s WHERE s.id = l.shift_id) AS packed_on,
+            (SELECT STRING_AGG(DISTINCT u.name, ', ' ORDER BY u.name)
+               FROM allocations a
+               JOIN packing_tables pt ON pt.table_no = a.table_no
+               JOIN users u ON u.id = pt.member_id
+              WHERE a.line_id = l.id) AS packer
        FROM grn_lines l
        LEFT JOIN (${PACKED_SQL}) p ON p.line_id = l.id
+       LEFT JOIN (${ADJUSTED_SQL}) j ON j.line_id = l.id
        LEFT JOIN (SELECT line_id, COUNT(*) AS open_exceptions FROM exceptions WHERE resolved_at IS NULL GROUP BY line_id) x ON x.line_id = l.id
        LEFT JOIN (SELECT line_id, COUNT(*) AS running FROM packing_txns WHERE status = 'Started' GROUP BY line_id) r ON r.line_id = l.id
        LEFT JOIN (SELECT line_id, ARRAY_AGG(table_no ORDER BY table_no) AS tables, COUNT(*) AS n FROM allocations GROUP BY line_id) a ON a.line_id = l.id
@@ -120,7 +152,12 @@ export async function lineById(lineId) {
   );
   if (!rows.length) return null;
   const l = rows[0];
-  return { ...l, pending: Number(l.grn_qty) - Number(l.packed), status: lineStatus(l), label_count: labelUnits(l).length };
+  return {
+    ...l,
+    pending: Number(l.grn_qty) - Number(l.packed) - Number(l.adjusted),
+    status: lineStatus(l),
+    label_count: labelUnits(l).length,
+  };
 }
 
 /** Headline figures for a shift — the dashboard tiles and the MIS metrics. */
@@ -136,15 +173,22 @@ export async function shiftStats(shiftId) {
               FROM packing_txns t
               JOIN lines l ON l.id = t.line_id
              WHERE t.status <> 'Started'
-             GROUP BY t.line_id)
+             GROUP BY t.line_id),
+          adj AS (
+            SELECT j.line_id, SUM(j.qty) AS qty
+              FROM qty_adjustments j
+              JOIN lines l ON l.id = j.line_id
+             GROUP BY j.line_id)
      SELECT (SELECT COUNT(*)::int FROM lines)                                         AS lines,
             (SELECT COALESCE(SUM(grn_qty), 0) FROM lines)                             AS grn,
             (SELECT COALESCE(SUM(qty), 0) FROM packed)                                AS packed,
+            (SELECT COALESCE(SUM(qty), 0) FROM adj)                                   AS adjusted,
             (SELECT COALESCE(SUM(pouches), 0)::int FROM packed)                       AS pouches,
             (SELECT COALESCE(SUM(boxes), 0)::int FROM packed)                         AS boxes,
             (SELECT COALESCE(SUM(txns), 0)::int FROM packed)                          AS txns,
             (SELECT COUNT(*)::int FROM lines l
-               WHERE COALESCE((SELECT qty FROM packed p WHERE p.line_id = l.id), 0) >= l.grn_qty) AS lines_packed,
+               WHERE COALESCE((SELECT qty FROM packed p WHERE p.line_id = l.id), 0)
+                   + COALESCE((SELECT qty FROM adj   j WHERE j.line_id = l.id), 0) >= l.grn_qty) AS lines_packed,
             (SELECT COUNT(*)::int FROM exceptions e JOIN lines l ON l.id = e.line_id) AS exc,
             (SELECT COUNT(*)::int FROM exceptions e JOIN lines l ON l.id = e.line_id
                WHERE e.resolved_at IS NULL)                                           AS exc_open`,
@@ -152,12 +196,14 @@ export async function shiftStats(shiftId) {
   );
   const grn = Number(row.grn);
   const packed = Number(row.packed);
+  const adjusted = Number(row.adjusted);
   return {
     lines: row.lines,
     linesPacked: row.lines_packed,
     grn,
     packed,
-    pending: grn - packed,           // BR-01
+    adjusted,
+    pending: grn - packed - adjusted,   // BR-01, less anything written off
     pouches: row.pouches,
     boxes: row.boxes,
     exc: row.exc,
@@ -186,6 +232,7 @@ export async function tableStats(shiftId) {
             COALESCE(al.done, 0)::int        AS completed_lines,
             COALESCE(al.grn, 0)::numeric     AS allocated_grn,
             COALESCE(al.packed, 0)::numeric  AS allocated_packed,
+            COALESCE(al.adjusted, 0)::numeric AS allocated_adjusted,
             COALESCE(tx.lines, 0)::int       AS lines
        FROM packing_tables pt
        LEFT JOIN users u ON u.id = pt.member_id
@@ -201,10 +248,12 @@ export async function tableStats(shiftId) {
                 COUNT(*) AS n,
                 SUM(l.grn_qty) AS grn,
                 SUM(COALESCE(p.packed, 0)) AS packed,
-                COUNT(*) FILTER (WHERE COALESCE(p.packed, 0) >= l.grn_qty) AS done
+                SUM(COALESCE(j.adjusted, 0)) AS adjusted,
+                COUNT(*) FILTER (WHERE COALESCE(p.packed, 0) + COALESCE(j.adjusted, 0) >= l.grn_qty) AS done
            FROM allocations a
            JOIN grn_lines l ON l.id = a.line_id
            LEFT JOIN (${PACKED_SQL}) p ON p.line_id = l.id
+           LEFT JOIN (${ADJUSTED_SQL}) j ON j.line_id = l.id
           WHERE l.shift_id = $1
           GROUP BY a.table_no) al ON al.table_no = pt.table_no
       WHERE pt.active
@@ -215,7 +264,7 @@ export async function tableStats(shiftId) {
     status: t.allocated_lines === 0 ? 'Free'
       : t.completed_lines >= t.allocated_lines ? 'Completed'
       : 'Occupied',
-    pending: Math.max(0, Number(t.allocated_grn) - Number(t.allocated_packed)),
+    pending: Math.max(0, Number(t.allocated_grn) - Number(t.allocated_packed) - Number(t.allocated_adjusted)),
   }));
 }
 

@@ -76,8 +76,36 @@ async function main() {
   if (unallocated) {
     const a1 = await call('POST', '/allocations', { token: T, body: { lineId: unallocated.id, tableNo: 'T-08' } });
     check('allocate a line to a table (FR-4.1)', a1.status === 201, `${unallocated.part_no} → T-08`);
+
+    /* A line goes to as many tables as the work needs — an invoice spread over
+       three tables is what the floor does. What BR-04 protects is that it
+       never gets there by accident, so the second table has to say why. */
     const a2 = await call('POST', '/allocations', { token: T, body: { lineId: unallocated.id, tableNo: 'T-07' } });
-    check('second table without an explicit split is refused (BR-04)', a2.status === 409);
+    check('a second table without a reason is refused (BR-04)', a2.status === 400, a2.data?.error);
+
+    const a3 = await call('POST', '/allocations', {
+      token: T,
+      body: { lineId: unallocated.id, tableNo: 'T-07', qty: 10, reason: 'Second table opened to clear the dispatch cut-off' },
+    });
+    check('a second table with a reason is allowed (FR-4.1)', a3.status === 201, `${a3.data?.tables?.join(' + ')}`);
+
+    const a4 = await call('POST', '/allocations', {
+      token: T,
+      body: { lineId: unallocated.id, tableNo: 'T-06', qty: 5, reason: 'Third table, same run' },
+    });
+    check('and so is a third — one invoice can sit on several tables', a4.status === 201,
+      `${a4.data?.tables?.join(' + ')}`);
+
+    const dup = await call('POST', '/allocations', {
+      token: T, body: { lineId: unallocated.id, tableNo: 'T-07', qty: 1, reason: 'Same table twice' },
+    });
+    check('the same line on the same table twice is still refused (BR-04)', dup.status === 409);
+
+    const over = await call('POST', '/allocations', {
+      token: T,
+      body: { lineId: unallocated.id, tableNo: 'T-05', qty: Number(unallocated.grn_qty) + 1, reason: 'Too much' },
+    });
+    check('allocated quantities cannot outrun the GRN quantity', over.status === 400, over.data?.error);
   } else {
     check('allocate a line to a table (FR-4.1)', false, 'no unallocated line to test with');
   }
@@ -122,6 +150,46 @@ async function main() {
     });
     check('over-packing is flagged as an Excess Entry (FR-7.2/BR-03)',
       sub.status === 200 && sub.data.exception?.type === 'Excess Entry', sub.data.exception?.id);
+  }
+
+  /* ---- BR-01 closing out a remainder nobody will pack ---- */
+  {
+    const fresh = await call('GET', `/lines?shiftId=${SHIFT}`, { token: T });
+    const part = fresh.data.lines.find((l) => Number(l.pending) > 1 && Number(l.packed) > 0)
+      ?? fresh.data.lines.find((l) => Number(l.pending) > 1);
+
+    if (part) {
+      const before = Number(part.pending);
+      const noReason = await call('POST', `/lines/${part.id}/adjust`, { token: T, body: { qty: 1 } });
+      check('a quantity adjustment without a reason is refused', noReason.status === 400, noReason.data?.error);
+
+      const tooMuch = await call('POST', `/lines/${part.id}/adjust`, {
+        token: T, body: { qty: before + 1, reason: 'More than is outstanding' },
+      });
+      check('writing off more than is outstanding is refused (BR-01)', tooMuch.status === 400, tooMuch.data?.error);
+
+      const ok = await call('POST', `/lines/${part.id}/adjust`, {
+        token: T, body: { qty: before, reason: 'Balance short-shipped — closed on the supplier’s debit note' },
+      });
+      check('the remainder can be written off with a reason (BR-01)', ok.status === 201,
+        `${part.part_no}: ${before} → ${ok.data?.pending}`);
+
+      const after = await call('GET', `/lines/${part.id}`, { token: T });
+      const l = after.data.line;
+      check('pending closes without touching GRN or packed (BR-01)',
+        Number(l.pending) === 0 && Number(l.grn_qty) === Number(part.grn_qty)
+          && Number(l.packed) === Number(part.packed),
+        `GRN ${l.grn_qty} − packed ${l.packed} − written off ${l.adjusted} = ${l.pending}`);
+      check('a closed-out line reads as Completed', l.status === 'Completed' || l.status === 'Exception', l.status);
+
+      const back = await call('POST', `/lines/${part.id}/adjust`, {
+        token: T, body: { qty: -before, reason: 'Debit note withdrawn — the balance is coming after all' },
+      });
+      check('and the write-off is undone by its opposite, not by a delete', back.status === 201,
+        `pending back to ${back.data?.pending}`);
+    } else {
+      check('the remainder can be written off with a reason (BR-01)', false, 'no line with pending quantity');
+    }
   }
 
   /* ---- FR-9 review, BR-03 finalise gate ---- */

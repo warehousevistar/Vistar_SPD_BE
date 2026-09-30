@@ -165,6 +165,28 @@ CREATE TABLE IF NOT EXISTS exceptions (
 );
 CREATE INDEX IF NOT EXISTS exceptions_line_idx ON exceptions (line_id);
 
+/* ------------------------------------------------- quantity adjustments ---
+   Pending is GRN − packed (BR-01), and neither term can simply be edited:
+   grn_qty is the figure SAP sent, and a packing transaction is never rewritten
+   (NFR-7.1). So closing out a remainder nobody will ever pack — five damaged,
+   five short-shipped, five found to be the wrong part — is a third term,
+   recorded with the reason it happened rather than by quietly moving one of
+   the other two.
+
+   The sign is free so that a close-out entered against the wrong line can be
+   undone by its opposite instead of being deleted; the handler is what keeps
+   the running total inside 0..grn_qty.
+*/
+CREATE TABLE IF NOT EXISTS qty_adjustments (
+  id         TEXT PRIMARY KEY,
+  line_id    TEXT NOT NULL REFERENCES grn_lines(id) ON DELETE CASCADE,
+  qty        NUMERIC(14,2) NOT NULL CHECK (qty <> 0),
+  reason     TEXT NOT NULL CHECK (reason <> ''),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  created_by TEXT REFERENCES users(id)
+);
+CREATE INDEX IF NOT EXISTS qty_adjustments_line_idx ON qty_adjustments (line_id);
+
 /* ------------------------------------------------------ hourly reports ----
    FR-8.3: retained for on-demand viewing in addition to the email.
 */

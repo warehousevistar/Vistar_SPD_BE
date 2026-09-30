@@ -50,17 +50,37 @@ allocRoutes.get('/allocations', canRead, wrap(async (req, res) => {
 }));
 
 /**
- * UC-03 / FR-4.1 / BR-04.
+ * UC-03 / FR-4.1 / BR-04 — putting a line on one table, or on several.
  *
- * Two shapes in one call, matching the Supervisor's allocation dialog: either
- * the whole line goes to one table (`tableNo`), or it is split between two
- * (`splitWith` + `qty1`/`qty2` + a mandatory reason). BR-04 is the rule that a
- * line cannot sit on two tables *by accident* — the split is allowed precisely
- * because it is explicit and reasoned.
+ * A line goes to as many tables as the work needs, and a table takes as many
+ * lines: an invoice of four parts can be spread over three tables and a table
+ * can be working parts from three invoices, which is what the floor does. The
+ * rule BR-04 actually protects is not *one table per line* — it is that a line
+ * never lands on a second table by accident. So the first table is a plain
+ * choice, and every table after it has to say why.
+ *
+ * Two shapes, because the dialog offers two: `{ tableNo }` sends the whole
+ * line to one table, and `{ tables: [{ tableNo, qty }, …], reason }` sends it
+ * to several at once, atomically, so a split cannot half-happen.
+ *
+ * `qty` is optional throughout, and NULL keeps its old meaning: *this table
+ * works this line, quantity unstated*. Several tables may hold NULL — that is
+ * a shared queue, and what each one actually did comes back in its packing
+ * transactions. Where quantities are stated they are shares of the line, so
+ * they may total less than the GRN quantity (the rest being unstated) but
+ * never more.
  */
 allocRoutes.post('/allocations', canSupervise, wrap(async (req, res) => {
-  const { lineId, tableNo, splitWith, qty1, qty2, reason } = req.body ?? {};
-  if (!lineId || !tableNo) throw badRequest('Choose a GRN line and a packing table');
+  const { lineId, reason } = req.body ?? {};
+  const wanted = Array.isArray(req.body?.tables) && req.body.tables.length
+    ? req.body.tables.map((t) => (typeof t === 'string' ? { tableNo: t } : t ?? {}))
+    : (req.body?.tableNo ? [{ tableNo: req.body.tableNo, qty: req.body.qty }] : []);
+
+  if (!lineId || !wanted.length) throw badRequest('Choose a GRN line and at least one packing table');
+  if (wanted.some((t) => !t.tableNo)) throw badRequest('Every allocation needs a table');
+
+  const dupes = wanted.map((t) => t.tableNo).filter((t, i, a) => a.indexOf(t) !== i);
+  if (dupes.length) throw badRequest(`${[...new Set(dupes)].join(', ')} is listed twice`);
 
   const out = await tx(async (q) => {
     const [line] = await q(
@@ -74,54 +94,60 @@ allocRoutes.post('/allocations', canSupervise, wrap(async (req, res) => {
       throw conflict(`${line.shift_label} is finalised — reopen the shift to change allocations (BR-06)`);
     }
 
-    const existing = await q('SELECT * FROM allocations WHERE line_id = $1', [lineId]);
+    const existing = await q('SELECT * FROM allocations WHERE line_id = $1 ORDER BY table_no', [lineId]);
     const grn = Number(line.grn_qty);
+    const r = String(reason || '').trim();
 
-    if (splitWith) {
-      if (splitWith === tableNo) throw badRequest('Pick two different tables for a split');
-      const r = String(reason || '').trim();
-      if (!r) throw badRequest('A split allocation must record a reason (BR-04)');
-      const a = Number(qty1);
-      const b = Number(qty2);
-      if (!(a > 0 && b > 0)) throw badRequest('Both split quantities must be greater than zero');
-      if (a + b !== grn) throw badRequest(`Split quantities must total the GRN quantity of ${nf(grn)} — ${nf(a)} + ${nf(b)} is ${nf(a + b)}`);
-      if (existing.length) throw conflict(`${line.part_no} is already allocated to ${existing.map((e) => e.table_no).join(', ')}`);
-
-      const id1 = await nextId('allocations', 'AL', 3, q);
-      await q(
-        `INSERT INTO allocations (id, line_id, table_no, qty, reason, allocated_by) VALUES ($1, $2, $3, $4, $5, $6)`,
-        [id1, lineId, tableNo, a, r, req.user.id],
-      );
-      const id2 = await nextId('allocations', 'AL', 3, q);
-      await q(
-        `INSERT INTO allocations (id, line_id, table_no, qty, reason, allocated_by) VALUES ($1, $2, $3, $4, $5, $6)`,
-        [id2, lineId, splitWith, b, r, req.user.id],
-      );
-      await audit({
-        actorId: req.user.id, action: 'Table Allocation (Split)', reference: line.part_no,
-        detail: `${tableNo} (${nf(a)}) + ${splitWith} (${nf(b)}) — ${r}`,
-        before: 'Unallocated', after: `${tableNo}+${splitWith}`,
-      }, q);
-      return { tables: [tableNo, splitWith], split: true };
-    }
-
-    // BR-04 — a second table without an explicit split is refused.
-    if (existing.length) {
-      throw conflict(
-        `${line.part_no} is already allocated to ${existing.map((e) => e.table_no).join(', ')} — a line cannot sit on two tables unless the quantity is explicitly split with a reason (BR-04)`,
+    /* BR-04 — anything past the first table is deliberate or it does not
+       happen. Both routes to a second table come through here: one call
+       naming several, and a later call adding one to a line already placed. */
+    if ((existing.length || wanted.length > 1) && !r) {
+      throw badRequest(
+        existing.length
+          ? `${line.part_no} is already on ${existing.map((e) => e.table_no).join(', ')} — say why it is also going to ${wanted.map((t) => t.tableNo).join(', ')} (BR-04)`
+          : 'Splitting a line across tables must record a reason (BR-04)',
       );
     }
 
-    const id = await nextId('allocations', 'AL', 3, q);
-    await q(
-      `INSERT INTO allocations (id, line_id, table_no, qty, reason, allocated_by) VALUES ($1, $2, $3, NULL, '', $4)`,
-      [id, lineId, tableNo, req.user.id],
-    );
+    const clash = wanted.filter((t) => existing.some((e) => e.table_no === t.tableNo));
+    if (clash.length) {
+      throw conflict(`${line.part_no} is already allocated to ${clash.map((t) => t.tableNo).join(', ')}`);
+    }
+
+    // Stated shares are shares of the line, so they cannot outrun it.
+    let stated = existing.reduce((s, e) => s + Number(e.qty ?? 0), 0);
+    for (const t of wanted) {
+      if (t.qty === undefined || t.qty === null || t.qty === '') { t.qty = null; continue; }
+      const n = Number(t.qty);
+      if (!(n > 0)) throw badRequest(`${t.tableNo} was given a quantity of ${t.qty} — it must be greater than zero`);
+      t.qty = n;
+      stated += n;
+    }
+    if (stated > grn) {
+      throw badRequest(
+        `Those quantities total ${nf(stated)}, more than the GRN quantity of ${nf(grn)} ${line.uom}`,
+      );
+    }
+
+    for (const t of wanted) {
+      const id = await nextId('allocations', 'AL', 3, q);
+      await q(
+        'INSERT INTO allocations (id, line_id, table_no, qty, reason, allocated_by) VALUES ($1, $2, $3, $4, $5, $6)',
+        [id, lineId, t.tableNo, t.qty, r, req.user.id],
+      );
+    }
+
+    const added = wanted.map((t) => (t.qty == null ? t.tableNo : `${t.tableNo} (${nf(t.qty)})`)).join(' + ');
+    const before = existing.length ? existing.map((e) => e.table_no).join('+') : 'Unallocated';
+    const tables = [...existing.map((e) => e.table_no), ...wanted.map((t) => t.tableNo)].sort();
     await audit({
-      actorId: req.user.id, action: 'Table Allocation', reference: line.part_no,
-      detail: `${line.invoice_no} → ${tableNo}`, before: 'Unallocated', after: tableNo,
+      actorId: req.user.id,
+      action: wanted.length > 1 || existing.length ? 'Table Allocation (Split)' : 'Table Allocation',
+      reference: line.part_no,
+      detail: `${line.invoice_no} → ${added}${r ? ` — ${r}` : ''}`,
+      before, after: tables.join('+'),
     }, q);
-    return { tables: [tableNo], split: false };
+    return { tables, added: wanted.map((t) => t.tableNo), split: tables.length > 1 };
   });
 
   res.status(201).json(out);

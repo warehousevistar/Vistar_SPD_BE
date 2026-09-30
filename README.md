@@ -79,7 +79,7 @@ src/
 └── services/
     ├── grnImport.js     FR-1.2 / FR-1.3 structural and row-level validation
     ├── excelExport.js   FR-12.1 workbook and CSV
-    ├── labels.js        FR-3 label PDF, QR encoder, Code 128
+    ├── labels.js        FR-3 label PDF, QR encoder
     ├── mailer.js        FR-8.2 SMTP delivery
     └── hourly.js        UC-06 report generation and the scheduler
 ```
@@ -105,14 +105,46 @@ talk to and skip themselves with a reason when there is none, so the command
 still runs anywhere.
 
 **The QR encoder is checked by decoding it.** `services/labels.js` writes the
-bit stream, Reed-Solomon, module placement and masking by hand, and nothing
-downstream would notice if that were subtly wrong — the label prints, it looks
-like a QR code, and the fault only appears when someone on the floor points a
-scanner at it. So `test/labels.test.js` carries a decoder written from the
-specification's reading order, proves it against a matrix from an independent
-implementation (the Dart `qr` package, captured by
-`frontend/tool/qr_reference.dart`), and then reads our own codes back to their
-payloads.
+bit stream, Reed-Solomon, block interleaving, module placement and masking by
+hand, and nothing downstream would notice if that were subtly wrong — the label
+prints, it looks like a QR code, and the fault only appears when someone on the
+floor points a scanner at it. So `test/labels.test.js` carries a decoder written
+from the specification's reading order, proves it against matrices from an
+independent implementation (the Dart `qr` package, captured by
+`frontend/tool/qr_reference.dart` — one per version), and then reads our own
+codes back to their payloads, checking each block's error-correction syndromes
+the way a scanner does.
+
+The encoder emits the smallest version that holds the payload and throws if none
+does:
+
+| version | modules | payload | module at 56pt | 203dpi dots |
+|---|---|---|---|---|
+| 2-M | 25×25 | ≤ 26 bytes | 0.790 mm | 6.3 |
+| 3-M | 29×29 | ≤ 42 bytes | 0.681 mm | 5.4 |
+| 4-M | 33×33 | ≤ 62 bytes | 0.599 mm | 4.8 |
+
+It stops at 4 for ink, not for code. Versions 5 and 6 need nothing the routine
+does not already do — the same single alignment pattern at (size-7, size-7), no
+version-information blocks until 7, equal-sized Reed-Solomon blocks at level M —
+but the label draws the code 56pt square whatever version it is, so the module
+shrinks as the payload grows: 0.534 mm at version 5 and 0.482 mm at version 6,
+which is 4.3 and 3.9 dots on a 203 dpi head. Below about four dots a module the
+printer rounds modules to different widths and the code stops scanning reliably,
+so a payload that would need version 5 is refused instead. Adding them back is
+two table rows, but the label would have to draw a bigger square first.
+
+Where that limit falls: `PART_RE` caps a part number at 40 characters, which
+against a three-digit quantity leaves 17 for the invoice number — `invoice_no`
+has no length rule of its own. An ordinary ten-character part number leaves 47.
+So the refusal bites only where a maximum-length part meets a long invoice.
+
+The encoder used to be fixed at version 2 and silently cut anything longer, which
+produced a valid, scannable code carrying the wrong part number — a legitimate
+40-character part number is enough to trigger it. A payload that fits version 2
+still produces byte-for-byte the code it always did, so labels already printed
+keep scanning; `test/labels.test.js` pins that down against matrices captured
+from the previous implementation.
 
 **The constraints are checked by breaking them.** Reading `schema.sql` tells you
 what a CHECK is meant to say, not whether PostgreSQL agrees — a subtly wrong
@@ -155,7 +187,7 @@ All routes are under `/api`. Everything except `/api/health`,
 |---|---|
 | `GET /lines` | invoice/part listing with live packed and pending (FR-2) |
 | `GET /lines/:id` | one line with its transactions, exceptions and allocations |
-| `GET /labels/:lineId/preview` | every label the line prints (FR-3.5), each with its own quantity, QR modules and barcode widths |
+| `GET /labels/:lineId/preview` | every label the line prints (FR-3.5), each with its own quantity and QR modules |
 | `POST /labels/:lineId/print` | logs the print; a reprint needs a reason (BR-09) |
 | `GET /labels/sheet.pdf` | the printable sheet (FR-3.2) |
 | `GET /labels/log` | the print log |
@@ -192,10 +224,12 @@ All routes are under `/api`. Everything except `/api/health`,
   pack plus a remainder: 350 against an MOQ of 300 is a 300 label and a 50
   label, because that is how the material leaves the table. Each label carries
   its own quantity, and therefore its own QR — a scanner pointed at the 50-unit
-  pouch has to read 50. The index is deliberately *not* in the payload: the
-  encoder's budget is 26 bytes and a typical payload already uses 23, so a
-  `|1/2` suffix would be silently truncated; two packs of the same size are
-  interchangeable anyway, and it is the printed "1 of 2" that tells them apart.
+  pouch has to read 50. The index is deliberately *not* in the payload: two
+  packs of the same size are interchangeable, and it is the printed "1 of 2"
+  that tells them apart. (It was once a budget question too — the encoder held
+  26 bytes and truncated anything longer. It now picks the smallest QR version
+  that fits and refuses what will not fit at all, so this is a decision about
+  what a scan should mean rather than a limit.)
   The GRN quantity stays on the label beside the pack quantity, so FR-3.1 is
   still satisfied.
 
